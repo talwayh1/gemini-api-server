@@ -284,6 +284,7 @@ class AccountPool:
                 "cooldown_s": max(0, int(a.cooldown_until - now)),
                 "requests": a.total_requests,
                 "failures": a.total_failures,
+                "proxy": a.proxy,
             }
             for a in self.accounts
         ]
@@ -694,11 +695,51 @@ async def api_logs(limit: int = 50):
         ],
     }
 
+@app.get("/api/proxy")
+async def api_proxy():
+    """检测代理连通性：对每个配置了 proxy 的账号测试 SOCKS5 可达性"""
+    import socket, asyncio
+    results = []
+    for a in pool.accounts:
+        entry = {"name": a.name, "proxy": a.proxy, "reachable": None}
+        if not a.proxy:
+            entry["status"] = "无代理（直连）"
+            entry["reachable"] = None
+            results.append(entry)
+            continue
+        # 解析 socks5://host:port
+        addr = a.proxy
+        if addr.startswith("socks5://"):
+            addr = addr[9:]
+        elif addr.startswith("socks5h://"):
+            addr = addr[10:]
+        host, _, port_str = addr.partition(":")
+        port = int(port_str) if port_str else 1080
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5
+            )
+            writer.close()
+            await writer.wait_closed()
+            entry["reachable"] = True
+            entry["status"] = "代理可达 ✅"
+        except Exception as e:
+            entry["reachable"] = False
+            entry["status"] = f"代理不通 ❌ ({str(e)[:60]})"
+        # 尝试获取 WARP IP
+        try:
+            import urllib.request
+            import socks
+        except Exception:
+            entry["warp_ip"] = "(需 socks 库)"
+        results.append(entry)
+    return {"proxy_checks": results}
+
 
 
 @app.get("/dashboard")
 async def dashboard():
-    """Web 仪表盘 — 账号状态 + 日志 + API 用法"""
+    """Web 仪表盘 — 账号状态 + 代理状态 + 日志 + API 用法"""
     html = """<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -712,12 +753,14 @@ h1{font-size:20px;margin-bottom:16px;color:#58a6ff}
 h2{font-size:15px;margin:16px 0 8px;color:#8b949e;border-bottom:1px solid #21262d;padding-bottom:4px}
 .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;margin-bottom:12px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.stat{font-size:13px}
+.stat{font-size:13px;margin-bottom:8px}
 .stat span{color:#8b949e}
 .stat strong{color:#e6edf3}
 .status-active{color:#3fb950}
 .status-cooldown{color:#d29922}
 .status-dead{color:#f85149}
+.status-ok{color:#3fb950}
+.status-fail{color:#f85149}
 .log-entry{font-family:'SF Mono',monospace;font-size:12px;padding:2px 0;border-bottom:1px solid #21262d}
 .log-entry .WARNING{color:#d29922}
 .log-entry .ERROR,.log-entry .CRITICAL{color:#f85149}
@@ -730,6 +773,10 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;o
 .tab{display:inline-block;padding:6px 12px;cursor:pointer;border:1px solid #30363d;border-bottom:none;border-radius:6px 6px 0 0;background:#0d1117;color:#8b949e;font-size:12px;margin-right:4px}
 .tab.active{background:#161b22;color:#e6edf3;border-bottom:1px solid #161b22}
 #log-container{max-height:400px;overflow-y:auto}
+.proxy-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;margin-left:4px}
+.proxy-warp{background:#1a2332;color:#f6821f;border:1px solid #f6821f44}
+.proxy-direct{background:#1a2332;color:#8b949e;border:1px solid #8b949e44}
+.ip-box{font-family:'SF Mono',monospace;font-size:13px;padding:4px 8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;display:inline-block;margin:4px 0}
 </style>
 </head>
 <body>
@@ -737,42 +784,49 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;o
 
 <div class="tabs">
 <span class="tab active" onclick="showTab('status')">账号状态</span>
+<span class="tab" onclick="showTab('proxy')">代理状态</span>
 <span class="tab" onclick="showTab('logs')">运行日志</span>
 <span class="tab" onclick="showTab('usage')">API 用法</span>
 </div>
 
 <div id="tab-status" class="card" style="display:block"></div>
+<div id="tab-proxy" class="card" style="display:none">
+  <button class="btn btn-sm" onclick="loadProxy()">刷新检测</button>
+  <div id="proxy-container"></div>
+</div>
 <div id="tab-logs" class="card" style="display:none">
   <button class="btn btn-sm" onclick="loadLogs()">刷新</button>
   <div id="log-container"></div>
 </div>
 <div id="tab-usage" class="card" style="display:none">
 <h2>接入地址</h2>
-<pre>API Base: http://IP:8787/v1</pre>
-<h2>curl 测试</h2>
-<pre>curl -X POST http://IP:8787/v1/chat/completions \\
+<pre>API Base: http://100.80.1.3:8787/v1</pre>
+<h2>curl 测试（非流式）</h2>
+<pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
 <h2>流式调用</h2>
-<pre>curl -X POST http://IP:8787/v1/chat/completions \\
+<pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"写首诗"}],"stream":true}'</pre>
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"写首诗"}],"stream":true}'</pre>
 <h2>JSON Schema 结构化输出</h2>
-<pre>curl -X POST http://IP:8787/v1/chat/completions \\
+<pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"列出3种水果"}],"response_format":{"type":"json_object"}}'</pre>
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"列出3种水果"}],"response_format":{"type":"json_object"}}'</pre>
 <h2>Tool Calling</h2>
-<pre>curl -X POST http://IP:8787/v1/chat/completions \\
+<pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"北京天气"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"获取天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'</pre>
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"北京天气"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"获取天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'</pre>
 <h2>图片分析</h2>
-<pre>curl -X POST http://IP:8787/v1/chat/completions \\
+<pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":[{"type":"text","text":"描述图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'</pre>
+  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"描述这张图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'</pre>
 <h2>接入 Hermes / OpenClaw / ChatBox</h2>
-<pre>API Base: http://IP:8787/v1
-API Key: 留空
-Model: gemini-3-flash / gemini-3-pro</pre>
+<pre>API Base: http://100.80.1.3:8787/v1
+API Key: 留空（或设置自定义 Key）
+Model: gemini-2.5-flash / gemini-2.5-pro</pre>
+<h2>模型列表</h2>
+<pre>curl http://100.80.1.3:8787/v1/models</pre>
 </div>
 
 <script>
@@ -784,20 +838,54 @@ async function loadHealth(){
     h+=`<div class="stat"><span>运行时间</span><br><strong>${d.uptime_human}</strong></div>`;
     h+=`<div class="stat"><span>总请求</span><br><strong>${d.server.requests_total}</strong></div>`;
     h+=`<div class="stat"><span>失败</span><br><strong>${d.server.requests_failed}</strong></div>`;
-    if(d.memory&&d.memory.vmrss)h+=`<div class="stat"><span>内存</span><br><strong>${d.memory.vmrss}</strong></div>`;
+    if(d.memory&&d.memory.vmrss)h+=`<div class="stat"><span>内存占用</span><br><strong>${d.memory.vmrss}</strong></div>`;
     h+='</div><h2>账号池</h2>';
     if(d.accounts){
       for(const a of d.accounts){
         const cls='status-'+a.status;
-        h+=`<div class="stat" style="margin-bottom:8px">`;
-        h+=`<strong>${a.name}</strong> <span class="${cls}">[${a.status}]</span><br>`;
+        h+=`<div class="stat">`;
+        h+=`<strong>${a.name}</strong> <span class="${cls}">[${a.status}]</span>`;
+        if(a.proxy)h+=` <span class="proxy-badge proxy-warp">WARP</span>`;
+        else h+=` <span class="proxy-badge proxy-direct">直连</span>`;
+        h+=`<br>`;
         h+=`<span>请求: ${a.requests} | 失败: ${a.failures}`;
         if(a.cooldown_s>0)h+=` | 冷却剩余: ${a.cooldown_s}s`;
+        if(a.proxy)h+=` | 代理: ${a.proxy}`;
         h+=`</span></div>`;
       }
     }
     document.getElementById('tab-status').innerHTML=h;
   }catch(e){}
+}
+
+async function loadProxy(){
+  try{
+    const r=await fetch('/api/proxy');
+    const d=await r.json();
+    let h='<h2>Cloudflare WARP 代理检测</h2>';
+    h+='<div class="stat" style="margin-bottom:12px"><span>WARP 代理端口: <code>172.17.0.1:40000</code>（宿主机 SOCKS5）</span></div>';
+    if(d.proxy_checks){
+      for(const p of d.proxy_checks){
+        const cls = p.reachable ? 'status-ok' : (p.reachable===false ? 'status-fail' : '');
+        h+=`<div class="stat" style="padding:8px;background:#0d1117;border-radius:4px;margin-bottom:6px">`;
+        h+=`<strong>${p.name}</strong> `;
+        if(p.proxy)h+=`<span class="proxy-badge proxy-warp">WARP</span> `;
+        else h+=`<span class="proxy-badge proxy-direct">直连</span> `;
+        if(cls)h+=`<span class="${cls}">[${p.status}]</span>`;
+        else h+=`<span>${p.status}</span>`;
+        if(p.warp_ip)h+=`<br><span>WARP 出口 IP: <span class="ip-box">${p.warp_ip}</span></span>`;
+        h+=`</div>`;
+      }
+    }
+    h+='<div style="margin-top:12px;color:#8b949e;font-size:12px">';
+    h+='<strong>说明:</strong><br>';
+    h+='• WARP 为 Cloudflare 免费代理，不限流量不限速<br>';
+    h+='• 代理模式仅影响 Gemini API 请求，不影响服务器其他网络<br>';
+    h+='• 如遇 IP 被风控，重启 WARP 即可换新 IP：<code>warp-cli disconnect && warp-cli connect</code><br>';
+    h+='• 代理地址 <code>socks5://172.17.0.1:40000</code> 在 <code>/opt/gemini/config/accounts.json</code> 中配置';
+    h+='</div>';
+    document.getElementById('proxy-container').innerHTML=h;
+  }catch(e){document.getElementById('proxy-container').innerHTML='<div class="stat status-fail">检测失败: '+e+'</div>';}
 }
 
 async function loadLogs(){
@@ -819,6 +907,7 @@ function showTab(name){
   document.querySelectorAll('[id^="tab-"]').forEach(d=>d.style.display='none');
   document.getElementById('tab-'+name).style.display='block';
   if(name==='logs')loadLogs();
+  if(name==='proxy')loadProxy();
 }
 
 loadHealth();
@@ -828,7 +917,6 @@ setInterval(loadHealth,10000);
 </html>"""
     from fastapi.responses import HTMLResponse
     return HTMLResponse(html)
-
 
 def _extract_image_markdown(response) -> str:
     """从 Gemini 响应中提取图片 URL 转为 markdown"""
