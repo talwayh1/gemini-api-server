@@ -121,6 +121,9 @@ class Account:
     cooldown_until: float = 0.0
     total_requests: int = 0
     total_failures: int = 0
+    request_timestamps: list = None
+    model_cache: list = None
+    model_cache_ts: float = 0.0
 
 
 class AccountPool:
@@ -128,6 +131,7 @@ class AccountPool:
         self.accounts: list[Account] = []
         self._idx = 0
         self._lock = asyncio.Lock()
+        self._request_log: list[dict] = []
 
     def load(self, path: Path) -> int:
         if not path.exists():
@@ -171,6 +175,14 @@ class AccountPool:
         log.info("Pool: %d/%d accounts ready", ready, len(self.accounts))
         if ready == 0:
             raise RuntimeError("No accounts initialized")
+        for a in self.accounts:
+            if a.client and a.fail_count < 999:
+                try:
+                    models = a.client.list_models()
+                    a.model_cache = [{"id": m.model_name, "display": m.display_name} for m in models]
+                    a.model_cache_ts = time.time()
+                except Exception:
+                    pass
 
     async def validate_all(self):
         """初始化后验证会话有效性（发一条静默消息检测 401/403）。"""
@@ -239,11 +251,18 @@ class AccountPool:
             raise RuntimeError(f"All {n} accounts down. Next: {best.name} in {wait:.0f}s")
 
     async def success(self, name: str):
+        now = time.time()
         for a in self.accounts:
             if a.name == name:
                 a.fail_count = 0
                 a.total_requests += 1
+                a.request_timestamps = (a.request_timestamps or []) + [now]
+                cutoff = now - 604800
+                a.request_timestamps = [t for t in a.request_timestamps if t > cutoff]
                 return
+        self._request_log.append({"ts": now, "account": name, "model": "?", "ok": True})
+        if len(self._request_log) > 1000:
+            self._request_log = self._request_log[-500:]
 
     async def failure(self, name: str, err: str):
         err_lower = err.lower()
@@ -276,10 +295,51 @@ class AccountPool:
         for a in self.accounts:
             if a.client and a.fail_count < 999:
                 try:
-                    return [{"id": m.model_name, "display": m.display_name} for m in a.client.list_models()]
+                    models = a.client.list_models()
+                    return [{"id": m.model_name, "display": m.display_name} for m in models]
                 except Exception:
                     continue
         return [{"id": "gemini-3-flash", "display": "Gemini 3 Flash (fallback)"}]
+
+    async def list_models_per_account(self) -> list[dict]:
+        results = []
+        for a in self.accounts:
+            entry = {"name": a.name, "status": "active" if a.fail_count < 999 else "dead", "models": []}
+            if a.client and a.fail_count < 999:
+                try:
+                    models = a.client.list_models()
+                    entry["models"] = [{"id": m.model_name, "display": m.display_name} for m in models]
+                except Exception as e:
+                    entry["models_error"] = str(e)[:120]
+            results.append(entry)
+        return results
+
+    async def account_status_all(self) -> list[dict]:
+        results = []
+        for a in self.accounts:
+            entry = {"name": a.name, "ok": False}
+            if a.client and a.fail_count < 999:
+                try:
+                    st = await a.client.inspect_account_status()
+                    entry["ok"] = True
+                    entry["deep_research"] = st.get("summary", {}).get("deep_research_feature_present", False)
+                    entry["rejected"] = st.get("summary", {}).get("rejected_probes", [])
+                except Exception as e:
+                    entry["error"] = str(e)[:120]
+            results.append(entry)
+        return results
+
+    def usage_stats(self) -> list[dict]:
+        now = time.time()
+        windows = {"1h": 3600, "24h": 86400, "7d": 604800}
+        results = []
+        for a in self.accounts:
+            ts = a.request_timestamps or []
+            entry = {"name": a.name, "total": a.total_requests, "failures": a.total_failures}
+            for label, sec in windows.items():
+                entry[label] = sum(1 for t in ts if now - t <= sec)
+            results.append(entry)
+        return results
 
     def stats(self) -> list[dict]:
         now = time.time()
@@ -295,6 +355,7 @@ class AccountPool:
                 "requests": a.total_requests,
                 "failures": a.total_failures,
                 "proxy": a.proxy,
+                "models": (a.model_cache or []),
             }
             for a in self.accounts
         ]
@@ -532,7 +593,22 @@ async def health():
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(request: Request = None):
+    account = request.query_params.get("account") if request else None
+    if account:
+        for a in pool.accounts:
+            if a.name == account and a.client and a.fail_count < 999:
+                try:
+                    models = a.client.list_models()
+                    return {
+                        "object": "list",
+                        "account": account,
+                        "data": [{"id": m.model_name, "object": "model", "owned_by": "google"} for m in models],
+                    }
+                except Exception:
+                    pass
+        raise HTTPException(404, f"Account {account} not available")
+
     return {
         "object": "list",
         "data": [
@@ -540,6 +616,16 @@ async def list_models():
             for m in pool.list_models()
         ],
     }
+
+
+@app.get("/api/models-per-account")
+async def models_per_account():
+    return {"accounts": await pool.list_models_per_account()}
+
+
+@app.get("/api/usage-stats")
+async def usage_stats():
+    return {"accounts": pool.usage_stats()}
 
 
 @app.post("/v1/chat/completions")
@@ -869,10 +955,49 @@ async function loadHealth(){
         if(a.cooldown_s>0)h+=` | 冷却剩余: ${a.cooldown_s}s`;
         if(a.proxy)h+=` | 代理: ${a.proxy}`;
         h+=`</span></div>`;
+        h+=`<div id="models-${a.name}" style="font-size:12px;margin:2px 0 4px 0">加载中...</div>`;
+        h+=`<div id="usage-${a.name}" style="font-size:11px;margin-bottom:4px">加载中...</div>`;
       }
     }
     document.getElementById('tab-status').innerHTML=h;
+    // Also fetch per-account models and usage
+    loadModels();
+    loadUsage();
   }catch(e){document.getElementById('tab-status').innerHTML='<div class="stat status-fail">加载失败: '+e.message+' | <a href="javascript:loadHealth()">重试</a></div>';}
+}
+
+async function loadModels(){
+  try{
+    const r=await fetch('/api/models-per-account');
+    const d=await r.json();
+    if(d.accounts){
+      for(const a of d.accounts){
+        const el=document.getElementById('models-'+a.name);
+        if(!el)continue;
+        if(a.models&&a.models.length){
+          el.innerHTML='<span style="color:#58a6ff">模型:</span> '+a.models.map(m=>'<code>'+m.id+'</code>').join(' ');
+        }else if(a.models_error){
+          el.innerHTML='<span style="color:#f85149">模型查询失败: '+a.models_error+'</span>';
+        }else{
+          el.innerHTML='<span style="color:#8b949e">暂不可用</span>';
+        }
+      }
+    }
+  }catch(e){}
+}
+
+async function loadUsage(){
+  try{
+    const r=await fetch('/api/usage-stats');
+    const d=await r.json();
+    if(d.accounts){
+      for(const a of d.accounts){
+        const el=document.getElementById('usage-'+a.name);
+        if(!el)continue;
+        el.innerHTML='<span style="color:#8b949e">用量: 1h='+a['1h']+' | 24h='+a['24h']+' | 7d='+a['7d']+' | 总计='+a.total+'</span>';
+      }
+    }
+  }catch(e){}
 }
 
 async function loadProxy(){
