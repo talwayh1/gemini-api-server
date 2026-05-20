@@ -143,6 +143,49 @@ class AccountPool:
         if ready == 0:
             raise RuntimeError("No accounts initialized")
 
+    async def validate_all(self):
+        """初始化后验证会话有效性（发一条静默消息检测 401/403）。"""
+        TEST_PROMPT = "Reply with exactly OK."
+        AUTH_FAIL_PATTERNS = ["sign in", "signed in", "log in", "logged in", "are you"]
+
+        async def _validate(acc: Account) -> bool:
+            if acc.fail_count >= 999 or not acc.client:
+                return False
+            try:
+                resp = await acc.client.generate_content(TEST_PROMPT, temporary=True)
+                text = (resp.text or "").strip().lower()
+                if not text or any(p in text for p in AUTH_FAIL_PATTERNS):
+                    log.warning("[%s] Session validation FAILED — auth degraded", acc.name)
+                    acc.fail_count = 999
+                    return False
+                log.info("[%s] Session validated OK", acc.name)
+                return True
+            except Exception as e:
+                log.warning("[%s] Session validation error: %s", acc.name, str(e)[:100])
+                return False
+
+        results = await asyncio.gather(*[_validate(a) for a in self.accounts])
+        valid = sum(results)
+        if valid == 0:
+            log.critical("ALL sessions invalid — cookies may have expired!")
+        else:
+            log.info("Session validation: %d/%d passed", valid, len(self.accounts))
+
+    async def keepalive(self, interval: int = 7200):
+        """后台保活：每隔 interval 秒对所有健康账号发一次静默消息，防止闲置失效。"""
+        KEEPALIVE_PROMPT = "Hello"
+        while True:
+            await asyncio.sleep(interval)
+            for a in self.accounts:
+                if a.fail_count >= 999 or not a.client:
+                    continue
+                try:
+                    await a.client.generate_content(KEEPALIVE_PROMPT, temporary=True)
+                    log.debug("[%s] Keepalive OK", a.name)
+                except Exception as e:
+                    log.warning("[%s] Keepalive failed: %s", a.name, str(e)[:80])
+                    # 保活失败不触发冷却，只记录
+
     async def get_client(self) -> tuple[GeminiClient, str]:
         async with self._lock:
             now = time.time()
@@ -167,10 +210,25 @@ class AccountPool:
                 return
 
     async def failure(self, name: str, err: str):
+        err_lower = err.lower()
         for a in self.accounts:
             if a.name == name:
                 a.fail_count += 1
                 a.total_failures += 1
+
+                # 429 / rate limit → 立即标记冷却（不等 3 次）
+                if "429" in err or "rate" in err_lower or "quota" in err_lower:
+                    a.cooldown_until = time.time() + 300
+                    log.warning("[%s] RATE LIMITED — cooldown 5min: %s", name, err[:120])
+                    return
+
+                # 401 / auth failure → 立即标记为 dead
+                if "401" in err or "unauthorized" in err_lower or "authenticated" in err_lower:
+                    a.fail_count = 999
+                    log.error("[%s] AUTH FAILED — marked dead (cookie expired?): %s", name, err[:120])
+                    return
+
+                # 常规失败：累积 3 次后冷却
                 if a.fail_count >= 3:
                     a.cooldown_until = time.time() + 300
                     log.warning("[%s] COOLDOWN 5min (x%d): %s", name, a.fail_count, err[:120])
@@ -219,7 +277,11 @@ async def lifespan(app: FastAPI):
         log.critical("No accounts! Edit config/accounts.json")
     else:
         await pool.init_all()
+        await pool.validate_all()  # 验证会话有效性
+    # 启动后台保活任务
+    keepalive_task = asyncio.create_task(pool.keepalive(interval=7200))
     yield
+    keepalive_task.cancel()
     for a in pool.accounts:
         if a.client:
             try:
