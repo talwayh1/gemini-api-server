@@ -269,7 +269,7 @@ class AccountPool:
                     return [{"id": m.model_name, "display": m.display_name} for m in a.client.list_models()]
                 except Exception:
                     continue
-        return [{"id": "gemini-2.5-flash", "display": "Gemini 2.5 Flash (fallback)"}]
+        return [{"id": "gemini-3-flash", "display": "Gemini 2.5 Flash (fallback)"}]
 
     def stats(self) -> list[dict]:
         now = time.time()
@@ -357,7 +357,7 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[dict] = None
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3-flash"
     messages: list[Message]
     stream: bool = False
     temperature: Optional[float] = None
@@ -804,27 +804,27 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;o
 <h2>curl 测试（非流式）</h2>
 <pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
+  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
 <h2>流式调用</h2>
 <pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"写首诗"}],"stream":true}'</pre>
+  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"写首诗"}],"stream":true}'</pre>
 <h2>JSON Schema 结构化输出</h2>
 <pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"列出3种水果"}],"response_format":{"type":"json_object"}}'</pre>
+  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"列出3种水果"}],"response_format":{"type":"json_object"}}'</pre>
 <h2>Tool Calling</h2>
 <pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"北京天气"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"获取天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'</pre>
+  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":"北京天气"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"获取天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'</pre>
 <h2>图片分析</h2>
 <pre>curl -X POST http://100.80.1.3:8787/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":[{"type":"text","text":"描述这张图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'</pre>
+  -d '{"model":"gemini-3-flash","messages":[{"role":"user","content":[{"type":"text","text":"描述这张图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'</pre>
 <h2>接入 Hermes / OpenClaw / ChatBox</h2>
 <pre>API Base: http://100.80.1.3:8787/v1
 API Key: 留空（或设置自定义 Key）
-Model: gemini-2.5-flash / gemini-2.5-pro</pre>
+Model: gemini-3-flash / gemini-3-pro</pre>
 <h2>模型列表</h2>
 <pre>curl http://100.80.1.3:8787/v1/models</pre>
 </div>
