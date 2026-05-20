@@ -55,7 +55,7 @@ class RingHandler(logging.Handler):
                     "STREAM", "PROXY", "WARP", "INIT", "POOL", "REFRESH",
                     "COMPLETE", "DONE", "ERROR", "SUCCESS", "STARTED",
                 )
-            ) or (msg.startswith("[") and record.levelno >= logging.INFO):
+            ) or ("[" in msg[:40] and record.levelno >= logging.INFO):
                 LOG_RING.append({"ts": record.created, "level": record.levelname, "msg": msg})
         except Exception:
             pass
