@@ -10,3 +10,10 @@ services:
       - ./cache:/app/cache
     environment:
       - GEMINI_COOKIE_PATH=/app/cache
+    # Docker 原生健康检查（配合 HEALTHCHECK 指令）
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

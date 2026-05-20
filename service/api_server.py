@@ -25,6 +25,38 @@ from gemini_webapi import GeminiClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("gemini-pool")
 
+# ── Container monitoring ─────────────────────────────────
+SERVER_START_TIME = time.time()
+SERVER_REQUESTS_TOTAL = 0  # atomic increment via health endpoint / chat
+SERVER_REQUESTS_FAILED = 0
+
+
+def _read_proc_mem() -> dict:
+    """Read container memory from /proc (no extra deps)."""
+    try:
+        with open("/proc/self/status") as f:
+            lines = f.read()
+        mem = {}
+        for key in ("VmRSS", "VmSize", "VmPeak"):
+            for line in lines.split("\n"):
+                if line.startswith(f"{key}:"):
+                    mem[key.lower()] = line.split(":")[1].strip()
+        # cgroup memory (Docker limit)
+        try:
+            with open("/sys/fs/cgroup/memory.current") as f:
+                mem["cgroup_current"] = f"{int(f.read().strip()) // 1048576} MB"
+        except Exception:
+            pass
+        try:
+            with open("/sys/fs/cgroup/memory.max") as f:
+                val = f.read().strip()
+                mem["cgroup_limit"] = "unlimited" if val == "max" else f"{int(val) // 1048576} MB"
+        except Exception:
+            pass
+        return mem
+    except Exception:
+        return {}
+
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
 ACCOUNTS_FILE = CONFIG_DIR / "accounts.json"
 
@@ -224,7 +256,19 @@ def _prompt(msgs: list[Msg]) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "accounts": pool.stats()}
+    uptime = int(time.time() - SERVER_START_TIME)
+    mem = _read_proc_mem()
+    return {
+        "status": "ok",
+        "uptime_seconds": uptime,
+        "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
+        "server": {
+            "requests_total": SERVER_REQUESTS_TOTAL,
+            "requests_failed": SERVER_REQUESTS_FAILED,
+        },
+        "memory": mem,
+        "accounts": pool.stats(),
+    }
 
 @app.get("/v1/models")
 async def list_models():
@@ -257,6 +301,7 @@ async def chat(req: ChatReq):
             resp = await client.generate_content(prompt, model=req.model)
             await pool.success(acc_name)
             text = resp.text if resp and resp.text else ""
+            SERVER_REQUESTS_TOTAL += 1
             return ChatResp(
                 id=rid, created=int(time.time()), model=req.model,
                 choices=[Choice(message={"role": "assistant", "content": text})],
@@ -268,6 +313,16 @@ async def chat(req: ChatReq):
             except Exception:
                 pass
     raise HTTPException(503, f"All accounts failed. Last: {last_err}")
+
+
+# ── Application-level counter reset for failed requests ──
+@app.middleware("http")
+async def _count_failed_requests(request, call_next):
+    global SERVER_REQUESTS_FAILED
+    response = await call_next(request)
+    if response.status_code >= 500:
+        SERVER_REQUESTS_FAILED += 1
+    return response
 
 
 async def _stream(model: str, prompt: str, rid: str):
