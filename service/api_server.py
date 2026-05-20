@@ -45,7 +45,17 @@ class RingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            if any(kw in msg for kw in ("Keepalive","FAIL","RATE","AUTH","COOLDOWN","Request","Ready","validated","session")):
+            upper = msg.upper()
+            # 按严重级别：WARNING / ERROR / CRITICAL 全部收录
+            # INFO 级别按关键词过滤
+            if record.levelno >= logging.WARNING or any(
+                kw in upper for kw in (
+                    "KEEPALIVE", "FAIL", "RATE", "AUTH", "COOLDOWN",
+                    "REQUEST", "READY", "VALIDATED", "SESSION", "MODEL",
+                    "STREAM", "PROXY", "WARP", "INIT", "POOL", "REFRESH",
+                    "COMPLETE", "DONE", "ERROR", "SUCCESS", "STARTED",
+                )
+            ):
                 LOG_RING.append({"ts": record.created, "level": record.levelname, "msg": msg})
         except Exception:
             pass
@@ -269,7 +279,7 @@ class AccountPool:
                     return [{"id": m.model_name, "display": m.display_name} for m in a.client.list_models()]
                 except Exception:
                     continue
-        return [{"id": "gemini-3-flash", "display": "Gemini 2.5 Flash (fallback)"}]
+        return [{"id": "gemini-3-flash", "display": "Gemini 3 Flash (fallback)"}]
 
     def stats(self) -> list[dict]:
         now = time.time()
@@ -564,6 +574,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 resp = await client.generate_content(prompt, **gen_kwargs)
                 await pool.success(acc_name)
                 SERVER_REQUESTS_TOTAL += 1
+                log.info("[%s] Request complete — %d chars", acc_name, len(resp.text) if resp and resp.text else 0)
 
                 text = resp.text if resp and resp.text else ""
                 # 追加图片 markdown
@@ -667,6 +678,7 @@ async def _stream_response(prompt: str, image_files: list[str], model: str, rid:
 
             await pool.success(acc_name)
             SERVER_REQUESTS_TOTAL += 1
+            log.info("[%s] Stream complete", acc_name)
             return
 
         except Exception as e:
