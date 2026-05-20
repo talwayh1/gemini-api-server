@@ -807,7 +807,12 @@ pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;o
   <div id="proxy-container"></div>
 </div>
 <div id="tab-logs" class="card" style="display:none">
-  <button class="btn btn-sm" onclick="loadLogs()">刷新</button>
+  <div style="margin-bottom:8px">
+    <button class="btn btn-sm" onclick="loadLogs()">刷新</button>
+    <button class="btn btn-sm" onclick="copyLogs()">复制</button>
+    <button class="btn btn-sm" onclick="clearLogs()">清空</button>
+    <span style="font-size:11px;color:#8b949e;margin-left:8px" id="log-status">自动刷新: 5s</span>
+  </div>
   <div id="log-container"></div>
 </div>
 <div id="tab-usage" class="card" style="display:none">
@@ -900,17 +905,31 @@ async function loadProxy(){
   }catch(e){document.getElementById('proxy-container').innerHTML='<div class="stat status-fail">检测失败: '+e+'</div>';}
 }
 
+let _logRaw='', _logTimer=null;
 async function loadLogs(){
   try{
     const r=await fetch('/api/logs?limit=80');
     const d=await r.json();
-    let h='';
+    let h=''; _logRaw='';
     for(const e of d.entries){
+      const line=`[${e.level}] ${e.msg}`;
+      _logRaw+=line+'\n';
       h+=`<div class="log-entry"><span class="${e.level}">[${e.level}]</span> ${e.msg}</div>`;
     }
     if(!h)h='<div class="log-entry">暂无日志</div>';
     document.getElementById('log-container').innerHTML=h;
   }catch(e){}
+}
+function copyLogs(){
+  if(!_logRaw){loadLogs();}
+  navigator.clipboard.writeText(_logRaw||'').then(()=>{
+    const s=document.getElementById('log-status');
+    s.textContent='已复制!';setTimeout(()=>s.textContent='自动刷新: 5s',1500);
+  }).catch(()=>alert('复制失败'));
+}
+function clearLogs(){
+  document.getElementById('log-container').innerHTML='<div class="log-entry">已清空</div>';
+  _logRaw='';
 }
 
 function showTab(name){
@@ -918,7 +937,8 @@ function showTab(name){
   event.target.classList.add('active');
   document.querySelectorAll('[id^="tab-"]').forEach(d=>d.style.display='none');
   document.getElementById('tab-'+name).style.display='block';
-  if(name==='logs')loadLogs();
+  clearInterval(_logTimer);
+  if(name==='logs'){loadLogs();_logTimer=setInterval(loadLogs,5000);}
   if(name==='proxy')loadProxy();
 }
 
