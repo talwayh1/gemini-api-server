@@ -913,7 +913,7 @@ async function loadLogs(){
     let h=''; _logRaw='';
     for(const e of d.entries){
       const line=`[${e.level}] ${e.msg}`;
-      _logRaw+=line+'\n';
+      _logRaw+=line+chr(10);
       h+=`<div class="log-entry"><span class="${e.level}">[${e.level}]</span> ${e.msg}</div>`;
     }
     if(!h)h='<div class="log-entry">暂无日志</div>';
