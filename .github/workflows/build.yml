@@ -1,35 +1,78 @@
-name: Build and Push Docker Image
+name: Watch Upstream & Build
 
 on:
+  schedule:
+    - cron: '*/30 * * * *'    # 每 30 分钟检测一次
   push:
     branches: [main]
     paths:
       - 'Dockerfile'
       - 'service/**'
       - '.github/workflows/build.yml'
-  schedule:
-    - cron: '0 6 * * *'  # 每天 UTC 6:00 自动 rebuild (跟上 gemini-webapi 更新)
-  workflow_dispatch:       # 手动触发
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_REPO: HanaokaYuzu/Gemini-API
 
 jobs:
-  build:
+  check-and-build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      should_build: ${{ steps.check.outputs.changed }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── 检测上游是否有新 commit ──
+      - name: Get latest upstream commit
+        id: upstream
+        run: |
+          SHA=$(git ls-remote https://github.com/${{ env.UPSTREAM_REPO }}.git HEAD | cut -f1)
+          echo "sha=${SHA}" >> $GITHUB_OUTPUT
+          echo "Latest upstream: ${SHA}"
+
+      - name: Restore last built commit cache
+        id: cache-upstream
+        uses: actions/cache/restore@v4
+        with:
+          path: .upstream-sha
+          key: upstream-sha-${{ steps.upstream.outputs.sha }}
+          restore-keys: |
+            upstream-sha-
+
+      - name: Compare with last build
+        id: check
+        run: |
+          LATEST="${{ steps.upstream.outputs.sha }}"
+          if [ -f .upstream-sha ]; then
+            LAST=$(cat .upstream-sha)
+            echo "Last built: ${LAST}"
+          else
+            LAST=""
+            echo "No previous build record"
+          fi
+
+          if [ "${LATEST}" != "${LAST}" ] || [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo ">>> Change detected, will build <<<"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo ">>> No change, skipping build <<<"
+          fi
+
+      # ── 构建 & 推送 Docker 镜像（仅当上游有更新或手动/代码变更触发）──
       - name: Set up Docker Buildx
+        if: steps.check.outputs.changed == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
+        if: steps.check.outputs.changed == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -37,6 +80,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.check.outputs.changed == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -44,9 +88,9 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,format=short
-            type=ref,event=branch
 
       - name: Build and push
+        if: steps.check.outputs.changed == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -55,3 +99,16 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ── 保存本次构建的上游 commit hash ──
+      - name: Save upstream commit marker
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.upstream.outputs.sha }}" > .upstream-sha
+
+      - name: Cache upstream commit
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .upstream-sha
+          key: upstream-sha-${{ steps.upstream.outputs.sha }}
