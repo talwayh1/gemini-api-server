@@ -55,7 +55,7 @@ class RingHandler(logging.Handler):
                     "STREAM", "PROXY", "WARP", "INIT", "POOL", "REFRESH",
                     "COMPLETE", "DONE", "ERROR", "SUCCESS", "STARTED",
                 )
-            ):
+            ) or (msg.startswith("[") and record.levelno >= logging.INFO):
                 LOG_RING.append({"ts": record.created, "level": record.levelname, "msg": msg})
         except Exception:
             pass
@@ -63,7 +63,7 @@ class RingHandler(logging.Handler):
 ring = RingHandler()
 ring.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 log.addHandler(ring)
-logging.getLogger().addHandler(ring)
+# Only attach to "gemini-api" logger, not root (avoids duplicates)
 
 # ── Paths ──────────────────────────────────────────────────
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
