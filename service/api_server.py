@@ -872,7 +872,7 @@ async function loadHealth(){
       }
     }
     document.getElementById('tab-status').innerHTML=h;
-  }catch(e){}
+  }catch(e){document.getElementById('tab-status').innerHTML='<div class="stat status-fail">加载失败: '+e.message+' | <a href="javascript:loadHealth()">重试</a></div>';}
 }
 
 async function loadProxy(){
@@ -918,7 +918,7 @@ async function loadLogs(){
     }
     if(!h)h='<div class="log-entry">暂无日志</div>';
     document.getElementById('log-container').innerHTML=h;
-  }catch(e){}
+  }catch(e){document.getElementById('log-container').innerHTML='<div class="log-entry ERROR">加载失败: '+e.message+'</div>';}
 }
 function copyLogs(){
   if(!_logRaw){loadLogs();}
@@ -934,7 +934,8 @@ function clearLogs(){
 
 function showTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  event.target.classList.add('active');
+  var el=document.querySelector('.tab[onclick*="'+name+'"]');
+  if(el)el.classList.add('active');
   document.querySelectorAll('[id^="tab-"]').forEach(d=>d.style.display='none');
   document.getElementById('tab-'+name).style.display='block';
   clearInterval(_logTimer);
