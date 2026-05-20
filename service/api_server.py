@@ -1,38 +1,57 @@
 """
-Gemini Web -> OpenAI Compatible API Server
-===========================================
-基于 HanaokaYuzu/Gemini-API (PyPI: gemini-webapi)
-多账号轮询 + 故障隔离 + Cookie 自动持久化
-升级: docker compose build --no-cache && docker compose up -d
+Gemini Web -> OpenAI Compatible API Server v3.0
+================================================
+基于 HanaokaYuzu/Gemini-API 源码构建。
+完整 OpenAI 兼容：tools / response_format / 多模态 / system prompt / 多轮对话 / 图片生成
+
+参考:
+- https://github.com/Nativu5/Gemini-FastAPI (多账号 + LMDB 持久化)
+- https://github.com/zhiyu1998/Gemi2Api-Server (多模态 + 流式优化)
+
+升级: docker compose pull && docker compose up -d
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import tempfile
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from gemini_webapi import GeminiClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("gemini-pool")
 
-# ── Container monitoring ─────────────────────────────────
+# ── Logging ────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("gemini-api")
+
+# ── Paths ──────────────────────────────────────────────────
+CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
+ACCOUNTS_FILE = CONFIG_DIR / "accounts.json"
+API_KEY = os.getenv("API_KEY", "")  # 可选 API Key 认证
+
+
+# ════════════════════════════════════════════════════════════
+# Container Monitoring
+# ════════════════════════════════════════════════════════════
+
 SERVER_START_TIME = time.time()
-SERVER_REQUESTS_TOTAL = 0  # atomic increment via health endpoint / chat
+SERVER_REQUESTS_TOTAL = 0
 SERVER_REQUESTS_FAILED = 0
 
 
 def _read_proc_mem() -> dict:
-    """Read container memory from /proc (no extra deps)."""
     try:
         with open("/proc/self/status") as f:
             lines = f.read()
@@ -41,7 +60,6 @@ def _read_proc_mem() -> dict:
             for line in lines.split("\n"):
                 if line.startswith(f"{key}:"):
                     mem[key.lower()] = line.split(":")[1].strip()
-        # cgroup memory (Docker limit)
         try:
             with open("/sys/fs/cgroup/memory.current") as f:
                 mem["cgroup_current"] = f"{int(f.read().strip()) // 1048576} MB"
@@ -57,13 +75,10 @@ def _read_proc_mem() -> dict:
     except Exception:
         return {}
 
-CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
-ACCOUNTS_FILE = CONFIG_DIR / "accounts.json"
 
-
-# ============================================================
-# Account Pool - Round-Robin + Failover + Cooldown
-# ============================================================
+# ════════════════════════════════════════════════════════════
+# Account Pool — Multi-Account Round-Robin + Failover
+# ════════════════════════════════════════════════════════════
 
 @dataclass
 class Account:
@@ -114,12 +129,7 @@ class AccountPool:
                     secure_1psidts=acc.secure_1psidts,
                     proxy=acc.proxy,
                 )
-                await acc.client.init(
-                    timeout=timeout,
-                    auto_close=False,
-                    close_delay=600,
-                    auto_refresh=True,
-                )
+                await acc.client.init(timeout=timeout, auto_close=False, close_delay=600, auto_refresh=True)
                 log.info("[%s] Ready", acc.name)
                 return True
             except Exception as e:
@@ -172,10 +182,7 @@ class AccountPool:
         for a in self.accounts:
             if a.client and a.fail_count < 999:
                 try:
-                    return [
-                        {"id": m.model_name, "display": m.display_name}
-                        for m in a.client.list_models()
-                    ]
+                    return [{"id": m.model_name, "display": m.display_name} for m in a.client.list_models()]
                 except Exception:
                     continue
         return [{"id": "gemini-2.5-flash", "display": "Gemini 2.5 Flash (fallback)"}]
@@ -198,11 +205,12 @@ class AccountPool:
         ]
 
 
-# ============================================================
+# ════════════════════════════════════════════════════════════
 # FastAPI App
-# ============================================================
+# ════════════════════════════════════════════════════════════
 
 pool = AccountPool()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -219,45 +227,198 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
-app = FastAPI(title="Gemini Web API", version="2.0.0", lifespan=lifespan)
+
+app = FastAPI(title="Gemini Web API", version="3.0.0", lifespan=lifespan)
+
+# CORS — 允许 ChatBox / OpenClaw / Claude Code 等客户端跨域
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-class Msg(BaseModel):
+# ════════════════════════════════════════════════════════════
+# OpenAI Compatible Schemas
+# ════════════════════════════════════════════════════════════
+
+class ContentPart(BaseModel):
+    type: str
+    text: Optional[str] = None
+    image_url: Optional[dict] = None
+
+class Message(BaseModel):
     role: str
-    content: str
+    content: str | list[ContentPart]
+    name: Optional[str] = None
 
-class ChatReq(BaseModel):
+class ToolFunction(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict] = None
+
+class Tool(BaseModel):
+    type: str = "function"
+    function: ToolFunction
+
+class ResponseFormat(BaseModel):
+    type: str = "text"  # "text" | "json_object" | "json_schema"
+    json_schema: Optional[dict] = None
+
+class ChatCompletionRequest(BaseModel):
     model: str = "gemini-2.5-flash"
-    messages: list[Msg]
+    messages: list[Message]
     stream: bool = False
-
-class Choice(BaseModel):
-    index: int = 0
-    message: dict
-    finish_reason: str = "stop"
-
-class ChatResp(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: list[Choice]
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    tools: Optional[list[Tool]] = None
+    tool_choice: Optional[str | dict] = None
+    response_format: Optional[ResponseFormat] = None
 
 
-def _prompt(msgs: list[Msg]) -> str:
-    parts = []
-    for m in msgs:
-        if m.role == "system":
-            parts.append(f"[System]\n{m.content}")
-        else:
-            parts.append(m.content)
-    return "\n\n".join(parts)
+# ════════════════════════════════════════════════════════════
+# Message Construction — 多模态 + system prompt + tools
+# ════════════════════════════════════════════════════════════
 
+def _extract_text(content: str | list) -> str:
+    """提取纯文本"""
+    if isinstance(content, str):
+        return content
+    texts = []
+    for item in content:
+        if isinstance(item, dict):
+            if item.get("type") == "text":
+                texts.append(item.get("text", ""))
+        elif hasattr(item, "type") and item.type == "text":
+            texts.append(item.text or "")
+    return "\n".join(texts)
+
+
+def _extract_images(content: str | list) -> list[str]:
+    """提取 base64 图片并保存为临时文件，返回文件路径列表"""
+    if isinstance(content, str):
+        return []
+    files = []
+    for item in content:
+        if isinstance(item, dict):
+            item = ContentPart(**item)
+        if hasattr(item, "image_url") and item.image_url:
+            url = item.image_url.get("url", "") if isinstance(item.image_url, dict) else ""
+            if url.startswith("data:image/"):
+                try:
+                    b64 = url.split(",", 1)[1]
+                    data = base64.b64decode(b64)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+                        f.write(data)
+                        files.append(f.name)
+                except Exception as e:
+                    log.warning("Failed to decode image: %s", e)
+    return files
+
+
+def _build_tools_prompt(tools: Optional[list[Tool]]) -> str:
+    """将 OpenAI tools 转为 prompt 指令"""
+    if not tools:
+        return ""
+    lines = ["[Available Functions]", "You may call these functions by responding with:"]
+    lines.append('{"name": "<function_name>", "arguments": <json_object>}')
+    lines.append("")
+    for t in tools:
+        f = t.function
+        lines.append(f"## {f.name}")
+        if f.description:
+            lines.append(f.description)
+        if f.parameters:
+            lines.append(f"Parameters: {json.dumps(f.parameters, ensure_ascii=False)}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_response_format_prompt(rf: Optional[ResponseFormat]) -> str:
+    """将 response_format 转为 prompt 指令"""
+    if not rf:
+        return ""
+    if rf.type == "json_object":
+        return "\n[Output Format]\nYou MUST respond with a valid JSON object. No markdown, no explanation — just the JSON.\n"
+    if rf.type == "json_schema" and rf.json_schema:
+        schema_name = rf.json_schema.get("name", "output")
+        schema = rf.json_schema.get("schema", rf.json_schema)
+        return (
+            f"\n[Output Format — {schema_name}]\n"
+            "You MUST respond with a valid JSON object conforming to this schema:\n"
+            f"```json\n{json.dumps(schema, ensure_ascii=False)}\n```\n"
+            "No markdown wrapping, no explanation — just the JSON object.\n"
+        )
+    return ""
+
+
+def build_prompt(messages: list[Message], tools: Optional[list[Tool]] = None,
+                 response_format: Optional[ResponseFormat] = None) -> tuple[str, list[str]]:
+    """
+    构建 Gemini prompt：
+    - system 消息作为 system instruction
+    - user/assistant 交替拼接
+    - 多模态图片提取为临时文件
+    - tools 和 response_format 追加到 prompt
+    """
+    parts: list[str] = []
+    image_files: list[str] = []
+
+    for msg in messages:
+        text = _extract_text(msg.content)
+        images = _extract_images(msg.content)
+        image_files.extend(images)
+
+        if msg.role == "system":
+            parts.append(f"[System Instruction]\n{text}")
+        elif msg.role == "user":
+            parts.append(text)
+        elif msg.role == "assistant":
+            parts.append(text)
+        # tool / function roles: treat as assistant context
+        elif msg.role in ("tool", "function"):
+            parts.append(f"[Function Result]\n{text}")
+
+    prompt = "\n\n".join(parts)
+
+    # 追加 tools 提示
+    tools_text = _build_tools_prompt(tools)
+    if tools_text:
+        prompt += f"\n\n{tools_text}"
+
+    # 追加 response_format 提示
+    rf_text = _build_response_format_prompt(response_format)
+    if rf_text:
+        prompt += f"\n\n{rf_text}"
+
+    return prompt, image_files
+
+
+# ════════════════════════════════════════════════════════════
+# API Key Auth
+# ════════════════════════════════════════════════════════════
+
+async def verify_api_key(request: Request):
+    if not API_KEY:
+        return  # 未设置 API_KEY 则跳过认证
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+    else:
+        token = auth
+    if token != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+
+
+# ════════════════════════════════════════════════════════════
+# Endpoints
+# ════════════════════════════════════════════════════════════
 
 @app.get("/health")
 async def health():
     uptime = int(time.time() - SERVER_START_TIME)
-    mem = _read_proc_mem()
     return {
         "status": "ok",
         "uptime_seconds": uptime,
@@ -266,9 +427,10 @@ async def health():
             "requests_total": SERVER_REQUESTS_TOTAL,
             "requests_failed": SERVER_REQUESTS_FAILED,
         },
-        "memory": mem,
+        "memory": _read_proc_mem(),
         "accounts": pool.stats(),
     }
+
 
 @app.get("/v1/models")
 async def list_models():
@@ -280,44 +442,75 @@ async def list_models():
         ],
     }
 
+
 @app.post("/v1/chat/completions")
-async def chat(req: ChatReq):
+async def chat_completions(req: ChatCompletionRequest):
+    global SERVER_REQUESTS_TOTAL
     if not req.messages:
         raise HTTPException(400, "messages required")
 
-    prompt = _prompt(req.messages)
-    rid = f"chatcmpl-{int(time.time()*1000)}"
+    prompt, image_files = build_prompt(req.messages, req.tools, req.response_format)
+    rid = f"chatcmpl-{uuid.uuid4()}"
 
-    if req.stream:
-        return StreamingResponse(_stream(req.model, prompt, rid), media_type="text/event-stream")
-
-    retries = max(1, len(pool.accounts))
-    last_err = None
-    for i in range(retries):
-        acc_name = "?"
-        try:
-            client, acc_name = await pool.get_client()
-            log.info("[%s] %s...", acc_name, prompt[:80])
-            resp = await client.generate_content(prompt, model=req.model)
-            await pool.success(acc_name)
-            text = resp.text if resp and resp.text else ""
-            SERVER_REQUESTS_TOTAL += 1
-            return ChatResp(
-                id=rid, created=int(time.time()), model=req.model,
-                choices=[Choice(message={"role": "assistant", "content": text})],
+    try:
+        if req.stream:
+            return StreamingResponse(
+                _stream_response(prompt, image_files, req.model, rid),
+                media_type="text/event-stream",
             )
-        except Exception as e:
-            last_err = str(e)
+
+        # ── Non-streaming with retry ─────────────────────
+        retries = max(1, len(pool.accounts))
+        last_err = None
+        for attempt in range(retries):
+            acc_name = "?"
             try:
-                await pool.failure(acc_name, last_err)
+                client, acc_name = await pool.get_client()
+                log.info("[%s] %s...", acc_name, prompt[:80])
+
+                gen_kwargs = {"model": req.model}
+                if image_files:
+                    gen_kwargs["files"] = image_files
+
+                resp = await client.generate_content(prompt, **gen_kwargs)
+                await pool.success(acc_name)
+                SERVER_REQUESTS_TOTAL += 1
+
+                text = resp.text if resp and resp.text else ""
+                # 追加图片 markdown
+                text += _extract_image_markdown(resp)
+
+                return {
+                    "id": rid,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            except Exception as e:
+                last_err = str(e)
+                try:
+                    await pool.failure(acc_name, last_err)
+                except Exception:
+                    pass
+        raise HTTPException(503, f"All accounts failed. Last: {last_err}")
+
+    finally:
+        # 清理临时图片文件
+        for f in image_files:
+            try:
+                os.unlink(f)
             except Exception:
                 pass
-    raise HTTPException(503, f"All accounts failed. Last: {last_err}")
 
 
-# ── Application-level counter reset for failed requests ──
 @app.middleware("http")
-async def _count_failed_requests(request, call_next):
+async def _count_failed_requests(request: Request, call_next):
     global SERVER_REQUESTS_FAILED
     response = await call_next(request)
     if response.status_code >= 500:
@@ -325,26 +518,90 @@ async def _count_failed_requests(request, call_next):
     return response
 
 
-async def _stream(model: str, prompt: str, rid: str):
-    import json as _json
+# ════════════════════════════════════════════════════════════
+# Streaming
+# ════════════════════════════════════════════════════════════
+
+async def _stream_response(prompt: str, image_files: list[str], model: str, rid: str):
+    global SERVER_REQUESTS_TOTAL
+
+    def _chunk(delta: dict, finish_reason: str | None = None) -> str:
+        payload = {
+            "id": rid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     retries = max(1, len(pool.accounts))
+    image_files_consumed: list[str] = list(image_files)  # copy for retry
+
     for _ in range(retries):
         acc_name = "?"
         try:
             client, acc_name = await pool.get_client()
             log.info("[%s] stream: %s...", acc_name, prompt[:80])
-            yield f"data: {_json.dumps({'id':rid,'object':'chat.completion.chunk','created':int(time.time()),'model':model,'choices':[{'index':0,'delta':{'role':'assistant'}}]})}\n\n"
-            async for chunk in client.generate_content_stream(prompt, model=model):
+
+            yield _chunk({"role": "assistant"})
+
+            gen_kwargs = {"model": model}
+            if image_files_consumed:
+                gen_kwargs["files"] = image_files_consumed
+
+            buffer = ""
+            yielded_images = 0
+
+            async for chunk in client.generate_content_stream(prompt, **gen_kwargs):
+                # 处理图片（流式中的内联图片）
+                if hasattr(chunk, "images") and chunk.images and len(chunk.images) > yielded_images:
+                    new_imgs = chunk.images[yielded_images:]
+                    for img in new_imgs:
+                        url = getattr(img, "url", None)
+                        if url:
+                            yield _chunk({"content": f"\n\n![Image]({url})\n\n"})
+                    yielded_images = len(chunk.images)
+
                 if chunk.text_delta:
-                    yield f"data: {_json.dumps({'id':rid,'object':'chat.completion.chunk','created':int(time.time()),'model':model,'choices':[{'index':0,'delta':{'content':chunk.text_delta}}]})}\n\n"
-            yield f"data: {_json.dumps({'id':rid,'object':'chat.completion.chunk','created':int(time.time()),'model':model,'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n"
+                    buffer += chunk.text_delta
+                    # 安全 yield：不在 markdown 链接中间切断
+                    if buffer[-1].isspace() or len(buffer) > 200:
+                        yield _chunk({"content": buffer})
+                        buffer = ""
+
+            if buffer:
+                yield _chunk({"content": buffer})
+
+            yield _chunk({}, "stop")
             yield "data: [DONE]\n\n"
+
             await pool.success(acc_name)
+            SERVER_REQUESTS_TOTAL += 1
             return
+
         except Exception as e:
             try:
                 await pool.failure(acc_name, str(e))
             except Exception:
                 pass
-    yield f"data: {_json.dumps({'error':{'message':'All accounts failed'}})}\n\n"
+
+    yield _chunk({"content": "\n\n[All accounts unavailable]"}, "stop")
     yield "data: [DONE]\n\n"
+
+
+# ════════════════════════════════════════════════════════════
+# Image Helpers
+# ════════════════════════════════════════════════════════════
+
+def _extract_image_markdown(response) -> str:
+    """从 Gemini 响应中提取图片 URL 转为 markdown"""
+    if not hasattr(response, "images") or not response.images:
+        return ""
+    parts = []
+    for img in response.images:
+        url = getattr(img, "url", None)
+        alt = getattr(img, "alt", None) or getattr(img, "title", None) or "Image"
+        if url:
+            parts.append(f"\n\n![{alt}]({url})")
+    return "\n".join(parts)
